@@ -2037,7 +2037,6 @@ version = "0.6.0"
 dependencies = [
  "base64",
  "data-url",
- "ecdsa",
  "ed25519-dalek",
  "indexmap",
  "p256",

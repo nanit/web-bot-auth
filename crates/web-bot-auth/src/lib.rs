@@ -66,6 +66,9 @@ pub enum ImplementationError {
     /// Verification of a parsed signature against a resolved key failed, indicating
     /// the signature was invalid.
     FailedToVerify(ed25519_dalek::SignatureError),
+    /// Verification of a parsed ECDSA signature against a resolved key failed, indicating
+    /// the signature was invalid.
+    FailedToVerifyEcdsa(String),
     /// A valid signature base must contain only ASCII characters; this error is thrown
     /// if that's not the case. This may be thrown if some of the headers included in
     /// covered components contained non-ASCII characters, for example. This will be thrown

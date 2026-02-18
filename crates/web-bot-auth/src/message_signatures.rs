@@ -549,6 +549,24 @@ impl MessageVerifier {
                         verification: UtcDateTime::now() - verification,
                     })
             }
+            Algorithm::EcdsaP256Sha256 => {
+                use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+                use p256::EncodedPoint;
+                let encoded_point = EncodedPoint::from_bytes(keying_material.1.as_slice())
+                    .map_err(|_| ImplementationError::InvalidKeyLength)?;
+                let verifying_key = VerifyingKey::from_encoded_point(&encoded_point)
+                    .map_err(|_| ImplementationError::InvalidKeyLength)?;
+                let sig = Signature::from_slice(self.parsed.signature.as_slice())
+                    .map_err(|_| ImplementationError::InvalidSignatureLength)?;
+                let verification = UtcDateTime::now();
+                verifying_key
+                    .verify(base_representation.as_bytes(), &sig)
+                    .map_err(|e| ImplementationError::FailedToVerifyEcdsa(e.to_string()))
+                    .map(|()| SignatureTiming {
+                        generation,
+                        verification: UtcDateTime::now() - verification,
+                    })
+            }
             other => Err(ImplementationError::UnsupportedAlgorithm(other.clone())),
         }
     }
@@ -674,6 +692,134 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_p256_sign_then_verify() {
+        use p256::ecdsa::{SigningKey, signature::Signer};
+
+        struct MyTest {
+            signature_input: String,
+            signature_header: String,
+        }
+
+        impl UnsignedMessage for MyTest {
+            fn fetch_components_to_cover(&self) -> IndexMap<CoveredComponent, String> {
+                IndexMap::from_iter([(
+                    CoveredComponent::Derived(DerivedComponent::Authority { req: false }),
+                    "example.com".to_string(),
+                )])
+            }
+
+            fn register_header_contents(
+                &mut self,
+                signature_input: String,
+                signature_header: String,
+            ) {
+                self.signature_input = format!("sig1={signature_input}");
+                self.signature_header = format!("sig1={signature_header}");
+            }
+        }
+
+        impl SignedMessage for MyTest {
+            fn lookup_component(&self, name: &CoveredComponent) -> Vec<String> {
+                match name {
+                    CoveredComponent::HTTP(HTTPField { name, .. }) => {
+                        if name == "signature" {
+                            return vec![self.signature_header.clone()];
+                        }
+                        if name == "signature-input" {
+                            return vec![self.signature_input.clone()];
+                        }
+                        vec![]
+                    }
+                    CoveredComponent::Derived(DerivedComponent::Authority { .. }) => {
+                        vec!["example.com".to_string()]
+                    }
+                    _ => vec![],
+                }
+            }
+        }
+
+        // Generate a P-256 key pair
+        let signing_key = SigningKey::from_bytes(&[
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+        ].into()).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let encoded_point = verifying_key.to_encoded_point(false);
+        let public_key_bytes = encoded_point.as_bytes().to_vec();
+
+        let mut keyring = KeyRing::default();
+        keyring.import_raw(
+            "test-p256-key".to_string(),
+            Algorithm::EcdsaP256Sha256,
+            public_key_bytes,
+        );
+
+        // Build the signature base manually, sign it, then verify
+        let components = IndexMap::from_iter([(
+            CoveredComponent::Derived(DerivedComponent::Authority { req: false }),
+            "example.com".to_string(),
+        )]);
+
+        let mut sfv_parameters = sfv::Parameters::new();
+        sfv_parameters.insert(
+            sfv::KeyRef::constant("keyid").to_owned(),
+            sfv::BareItem::String(sfv::StringRef::from_str("test-p256-key").unwrap().to_owned()),
+        );
+        sfv_parameters.insert(
+            sfv::KeyRef::constant("alg").to_owned(),
+            sfv::BareItem::String(sfv::StringRef::from_str("ecdsa-p256-sha256").unwrap().to_owned()),
+        );
+        sfv_parameters.insert(
+            sfv::KeyRef::constant("nonce").to_owned(),
+            sfv::BareItem::String(sfv::StringRef::from_str("test-nonce").unwrap().to_owned()),
+        );
+        sfv_parameters.insert(
+            sfv::KeyRef::constant("tag").to_owned(),
+            sfv::BareItem::String(sfv::StringRef::from_str("web-bot-auth").unwrap().to_owned()),
+        );
+
+        let created = time::UtcDateTime::now();
+        let expiry = created + Duration::seconds(10);
+        sfv_parameters.insert(
+            sfv::KeyRef::constant("created").to_owned(),
+            sfv::BareItem::Integer(sfv::Integer::constant(created.unix_timestamp())),
+        );
+        sfv_parameters.insert(
+            sfv::KeyRef::constant("expires").to_owned(),
+            sfv::BareItem::Integer(sfv::Integer::constant(expiry.unix_timestamp())),
+        );
+
+        let sig_base = SignatureBase {
+            components,
+            parameters: sfv_parameters.into(),
+        };
+        let (base_repr, sig_params_content) = sig_base.into_ascii().unwrap();
+
+        let ecdsa_sig: p256::ecdsa::Signature = signing_key.sign(base_repr.as_bytes());
+        let sig_bytes = ecdsa_sig.to_bytes();
+
+        let signature_header = sfv::Item {
+            bare_item: sfv::BareItem::ByteSequence(sig_bytes.to_vec()),
+            params: sfv::Parameters::new(),
+        }
+        .serialize_value();
+
+        let mut mytest = MyTest {
+            signature_input: format!("sig1={sig_params_content}"),
+            signature_header: format!("sig1={signature_header}"),
+        };
+
+        let _ = &mut mytest; // suppress unused warning
+
+        let verifier = MessageVerifier::parse(&mytest, |(_, _)| true).unwrap();
+        let timing = verifier.verify(&keyring, None).unwrap();
+        assert!(timing.generation.whole_nanoseconds() > 0);
+        assert!(timing.verification.whole_nanoseconds() > 0);
     }
 
     #[test]

@@ -134,6 +134,23 @@ impl Thumbprintable {
                 }
                 _ => Err(KeyringError::UnsupportedAlgorithm),
             },
+            Thumbprintable::EC { crv, x, y } => match crv.as_str() {
+                "P-256" => {
+                    let x_bytes = general_purpose::URL_SAFE_NO_PAD
+                        .decode(x)
+                        .map_err(KeyringError::ParsingError)?;
+                    let y_bytes = general_purpose::URL_SAFE_NO_PAD
+                        .decode(y)
+                        .map_err(KeyringError::ParsingError)?;
+                    // Build SEC1 uncompressed point: 0x04 || x || y
+                    let mut point = Vec::with_capacity(1 + x_bytes.len() + y_bytes.len());
+                    point.push(0x04);
+                    point.extend_from_slice(&x_bytes);
+                    point.extend_from_slice(&y_bytes);
+                    Ok(point)
+                }
+                _ => Err(KeyringError::UnsupportedAlgorithm),
+            },
             _ => Err(KeyringError::UnsupportedAlgorithm),
         }
     }
@@ -147,6 +164,10 @@ impl Thumbprintable {
         match self {
             Thumbprintable::OKP { crv, .. } => match crv.as_str() {
                 "Ed25519" => Ok(Algorithm::Ed25519),
+                _ => Err(KeyringError::UnsupportedAlgorithm),
+            },
+            Thumbprintable::EC { crv, .. } => match crv.as_str() {
+                "P-256" => Ok(Algorithm::EcdsaP256Sha256),
                 _ => Err(KeyringError::UnsupportedAlgorithm),
             },
             _ => Err(KeyringError::UnsupportedAlgorithm),
@@ -247,5 +268,40 @@ mod tests {
             String::from("test-key-ed25519")
         ));
         assert!(keyring.get(&String::from("test-key-ed25519")).is_some());
+    }
+
+    #[test]
+    fn test_importing_p256_key_from_jwks() {
+        let mut keyring = KeyRing::default();
+        let jwks: JSONWebKeySet = serde_json::from_str(
+            r#"{"keys":[{"kty":"EC","crv":"P-256","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}]}"#
+        ).unwrap();
+        let results = keyring.import_jwks(jwks);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_none(), "P-256 key import should succeed");
+        // Verify the key was stored with the correct algorithm
+        let thumbprint = Thumbprintable::EC {
+            crv: "P-256".to_string(),
+            x: "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU".to_string(),
+            y: "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0".to_string(),
+        };
+        let key = keyring.get(&thumbprint.b64_thumbprint());
+        assert!(key.is_some());
+        assert_eq!(key.unwrap().0, Algorithm::EcdsaP256Sha256);
+        // SEC1 uncompressed point should be 65 bytes (1 + 32 + 32)
+        assert_eq!(key.unwrap().1.len(), 65);
+        assert_eq!(key.unwrap().1[0], 0x04);
+    }
+
+    #[test]
+    fn test_importing_mixed_jwks_ed25519_and_p256() {
+        let mut keyring = KeyRing::default();
+        let jwks: JSONWebKeySet = serde_json::from_str(
+            r#"{"keys":[{"kty":"OKP","crv":"Ed25519","x":"JrQLj5P_89iXES9-vFgrIy29clF9CC_oPPsw3c5D0bs"},{"kty":"EC","crv":"P-256","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}]}"#
+        ).unwrap();
+        let results = keyring.import_jwks(jwks);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_none(), "Ed25519 key should import successfully");
+        assert!(results[1].is_none(), "P-256 key should import successfully");
     }
 }
